@@ -5,12 +5,15 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	callvideo "wacalls/internal/voip/call/video"
 	"wacalls/internal/voip/core"
 	"wacalls/internal/voip/media"
 	"wacalls/internal/voip/signaling"
 	"wacalls/internal/voip/transport"
 	"wacalls/internal/voip/wanode"
 
+	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -25,27 +28,57 @@ type CallManager struct {
 	srtpSession *media.SrtpSession
 	codec       media.Codec
 	relay       RelayTransport
+	mediaClock  *media.MediaClock // relógio único da call (áudio+vídeo no mesmo eixo)
 
 	selfSsrc      uint32
 	peerSsrcs     []uint32
 	actualPeerSet bool
 
+	video *callvideo.Pipeline
+
 	firstPacketSent       bool
 	initialTransportSent  bool
 	outgoingPreacceptSent bool
 	acceptedByJid         string
+	calleeDevices         []types.JID
 	debeEnabled           bool
 
-	encodeBuf    []float32
-	encodeBufPos int
+	captureBuf   []float32
+	sendLoopStop chan struct{}
 
-	lastCaptureAt time.Time
-	keepaliveStop chan struct{}
+	// Estado de espera (hold). Enquanto held, o áudio do atendente não é enviado:
+	// no lugar vai música de espera (mohEnabled) ou silêncio, e o áudio do peer não
+	// é encaminhado ao navegador. O leg segue vivo (media-level, sem sinalizar mute).
+	held       bool
+	mohEnabled bool
+	mohPos     int
+
+	audioTimelineSet   bool
+	audioBaseTs        uint32
+	audioPlayedSamples uint64
+
+	recvDiagN     uint64 // diagnóstico: nº de pacotes de áudio do peer recebidos/decodificados do relay
+	rtpRecvN      uint64 // diagnóstico: nº de pacotes RTP crus recebidos do relay (qualquer payload type)
+	unprotectErrN uint64 // diagnóstico: nº de falhas de SRTP unprotect no áudio do peer
+	// peerCallKey: call key que o peer mandou no accept quando difere da nossa; a
+	// chave de RECEPÇÃO é derivada dela (initSrtpKeysLocked não pode voltar à nossa).
+	peerCallKey []byte
+	audioRtpN   uint64 // diagnóstico: nº de pacotes RTP de áudio (PT do WhatsApp) recebidos
+	// energia do áudio decodificado do peer (soma dos quadrados e nº de amostras): média
+	// ~0 com pacotes chegando = chave SRTP errada ou peer mudo (o unprotect não valida a tag).
+	peerEnergySum     float64
+	peerEnergySamples uint64
 
 	OnStateChange func(*CallInfo)
 	OnIncoming    func(*CallInfo)
 	OnEnded       func(*CallInfo)
 	OnPeerAudio   func([]float32)
+	OnPeerVideo   func([]byte)
+
+	OnVideoUpgradeRequest func(*CallInfo) // o peer pediu um upgrade p/ vídeo
+	OnVideoStateChanged   func(*CallInfo) // qualquer mudança no estado de vídeo
+	OnPeerMute            func(*CallInfo) // o peer mutou/abriu o microfone (<mute_v2>)
+	OnHandRaise           func(*CallInfo) // o peer levantou/baixou a mão (raise_hand)
 }
 
 func NewCallManager(sock core.VoipSocket, log *slog.Logger) *CallManager {
@@ -61,6 +94,14 @@ func NewCallManager(sock core.VoipSocket, log *slog.Logger) *CallManager {
 	relay.SetOnConnected(func(ip string, port int) { m.onRelayConnected() })
 	relay.SetOnReceive(func(data []byte) { m.onRelayData(data) })
 	m.relay = relay
+	m.video = callvideo.New(log, relay)
+	m.video.OnFrame = func(au []byte) {
+		m.notePeerVideoActive()
+		if m.OnPeerVideo != nil {
+			m.OnPeerVideo(au)
+		}
+	}
+	m.video.OnOrientation = func(o int) { m.notePeerVideoOrientation(o) }
 	return m
 }
 
@@ -68,6 +109,42 @@ func (m *CallManager) CurrentCall() *CallInfo {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.currentCall
+}
+
+// Hold coloca a chamada ativa em espera. O leg permanece vivo: paramos de enviar o
+// áudio do atendente (enviando música de espera se moh=true, senão silêncio) e de
+// encaminhar o áudio do peer ao navegador. Não sinaliza mute ao WhatsApp de propósito,
+// para o interlocutor continuar recebendo mídia (a música).
+func (m *CallManager) Hold(moh bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.currentCall == nil {
+		return &CallError{"no active call"}
+	}
+	if err := m.currentCall.ApplyTransition(Transition{Type: TransitionHold}); err != nil {
+		return err
+	}
+	m.held = true
+	m.mohEnabled = moh
+	m.mohPos = 0
+	m.emitState()
+	return nil
+}
+
+// Resume tira a chamada da espera e volta a enviar/receber o áudio normalmente.
+func (m *CallManager) Resume() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.currentCall == nil {
+		return &CallError{"no active call"}
+	}
+	if err := m.currentCall.ApplyTransition(Transition{Type: TransitionResume}); err != nil {
+		return err
+	}
+	m.held = false
+	m.mohEnabled = false
+	m.emitState()
+	return nil
 }
 
 func (m *CallManager) emitState() {
@@ -102,17 +179,18 @@ func (m *CallManager) StartCall(ctx context.Context, callID string, peerJid type
 
 	selfJid := creator.String()
 	m.selfSsrc = media.GenerateSecureSsrc(callID, selfJid, 0)
-	m.rtpSession = media.NewWhatsAppOpusSession(m.selfSsrc)
+	m.rtpSession = m.newAudioRtpLocked(m.selfSsrc)
 	m.peerSsrcs = []uint32{media.GenerateSecureSsrc(callID, resolved.String(), 0)}
 	m.initCodec()
 	m.mu.Unlock()
 
-	offer, err := signaling.BuildOfferStanza(ctx, m.sock, callID, callKey, resolved, isVideo)
+	offer, calleeDevices, err := signaling.BuildOfferStanza(ctx, m.sock, callID, callKey, resolved, isVideo)
 	if err != nil {
 		return err
 	}
 
 	m.mu.Lock()
+	m.calleeDevices = calleeDevices
 	_ = m.currentCall.ApplyTransition(Transition{Type: TransitionOfferSent})
 	m.emitState()
 	m.mu.Unlock()
@@ -184,11 +262,17 @@ func (m *CallManager) RejectCall(ctx context.Context, callID string, reason core
 		return &CallError{"no call with id " + callID}
 	}
 	_ = call.ApplyTransition(Transition{Type: TransitionLocalRejected, Reason: reason})
-	node := signaling.BuildRejectStanza(wanode.MustJID(call.PeerJid), call.CallID, wanode.MustJID(call.CallCreator))
+	peer := wanode.MustJID(call.PeerJid)
+	// from=ownID no perfil do peer: LID p/ peer @lid, PN p/ peer @s.whatsapp.net.
+	own := m.sock.OwnLID()
+	if peer.Server == types.DefaultUserServer {
+		own = m.sock.OwnPN()
+	}
+	node := signaling.BuildRejectStanza(peer, call.CallID, wanode.MustJID(call.CallCreator), own)
 	m.emitState()
 	m.mu.Unlock()
 
-	go func() { _, _ = m.sock.Query(ctx, node) }()
+	go m.sendEndStanza(ctx, node)
 	m.cleanupMedia()
 	return nil
 }
@@ -206,12 +290,24 @@ func (m *CallManager) EndCall(ctx context.Context, reason core.EndCallReason) er
 	m.emitState()
 	m.mu.Unlock()
 
-	go func() { _, _ = m.sock.Query(ctx, node) }()
+	go m.sendEndStanza(ctx, node)
 	if m.OnEnded != nil {
 		m.OnEnded(ended)
 	}
 	m.cleanupMedia()
 	return nil
+}
+
+// sendEndStanza envia reject/terminate com 1 nova tentativa: socket em
+// reconexão perdia o stanza e o outro lado seguia tocando/em chamada.
+func (m *CallManager) sendEndStanza(ctx context.Context, node waBinary.Node) {
+	if _, err := m.sock.Query(ctx, node); err == nil || ctx.Err() != nil {
+		return
+	}
+	time.Sleep(500 * time.Millisecond)
+	if _, err := m.sock.Query(ctx, node); err != nil {
+		m.log.Warn("falha ao enviar fim de chamada (2 tentativas)", "tag", node.Tag, "err", err)
+	}
 }
 
 func (m *CallManager) ownCredJid() string {

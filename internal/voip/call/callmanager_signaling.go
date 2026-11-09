@@ -2,6 +2,7 @@ package call
 
 import (
 	"context"
+	"strings"
 	"wacalls/internal/voip/core"
 	"wacalls/internal/voip/media"
 	"wacalls/internal/voip/signaling"
@@ -11,7 +12,10 @@ import (
 	"go.mau.fi/whatsmeow/types"
 )
 
-func (m *CallManager) HandleCallOffer(ctx context.Context, node *waBinary.Node, peerJid types.JID) {
+// callerPn é o telefone real (PN) do chamador quando o offer o traz (atributo
+// caller_pn, exposto pelo whatsmeow em CallOffer.CallCreatorAlt). Vem vazio quando
+// só há LID. Guardamos em CallInfo.CallerPn p/ não depender do mapa local de LID.
+func (m *CallManager) HandleCallOffer(ctx context.Context, node *waBinary.Node, peerJid types.JID, callerPn string) {
 	info := signaling.ExtractNodeInfo(node)
 	if info == nil {
 		return
@@ -38,7 +42,7 @@ func (m *CallManager) HandleCallOffer(ctx context.Context, node *waBinary.Node, 
 	}
 
 	m.mu.Lock()
-	call := NewIncomingCall(callID, peerJid.String(), creator, "", mediaType)
+	call := NewIncomingCall(callID, peerJid.String(), creator, callerPn, mediaType)
 	if callKey != nil {
 		call.EncryptionKey = callKey
 	}
@@ -61,14 +65,14 @@ func (m *CallManager) HandleCallOffer(ctx context.Context, node *waBinary.Node, 
 		sj = m.sock.OwnPN().String()
 	}
 	m.selfSsrc = media.GenerateSecureSsrc(callID, sj, 0)
-	m.rtpSession = media.NewWhatsAppOpusSession(m.selfSsrc)
+	m.rtpSession = m.newAudioRtpLocked(m.selfSsrc)
 	m.peerSsrcs = []uint32{media.GenerateSecureSsrc(callID, peerJid.String(), 0)}
 	// SSRC/SRTP a partir dos participantes do relay (igual à saída em HandleCallAck)
 	ourBase := wanode.CleanJID(m.ownCredJid())
 	if len(parsed.ParticipantJids) > 0 {
 		ourDeviceJid := ensureDeviceJid(findOurDevice(parsed.ParticipantJids, ourBase, m.ownCredJid()))
 		m.selfSsrc = media.GenerateSecureSsrc(callID, ourDeviceJid, 0)
-		m.rtpSession = media.NewWhatsAppOpusSession(m.selfSsrc)
+		m.rtpSession = m.newAudioRtpLocked(m.selfSsrc)
 		if peer := firstPeerDevice(parsed.ParticipantJids, ourBase); peer != "" {
 			m.peerSsrcs = []uint32{media.GenerateSecureSsrc(callID, ensureDeviceJid(peer), 0)}
 		}
@@ -96,6 +100,16 @@ func (m *CallManager) HandleCallOffer(ctx context.Context, node *waBinary.Node, 
 func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node, peerJid types.JID) {
 	m.mu.Lock()
 	call := m.currentCall
+	// First accept wins: um accept posterior de OUTRO device (sibling) não pode
+	// trocar acceptedByJid nem rekey o SRTP com a mídia já estabelecida. Um retry
+	// do MESMO device passa: o primeiro accept pode ter trazido uma call key que
+	// não decifrou (desync de sessão signal) e a retransmissão é a única chance de
+	// reparar a chave.
+	if accepted := m.acceptedByJid; accepted != "" && accepted != peerJid.String() {
+		m.mu.Unlock()
+		m.log.Info("accept from another device ignored", "accepted_by", accepted, "from", peerJid.String())
+		return
+	}
 	m.mu.Unlock()
 	if call == nil {
 		return
@@ -118,6 +132,7 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 	m.mu.Lock()
 	_ = call.ApplyTransition(Transition{Type: TransitionRemoteAccepted})
 	m.emitState()
+	firstAccept := m.acceptedByJid == ""
 	m.acceptedByJid = peerJid.String()
 	if m.peerSsrcs == nil || !m.actualPeerSet {
 		peerDeviceJid := ensureDeviceJid(peerJid.String())
@@ -127,6 +142,17 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 	m.initSrtpKeysLocked()
 	hasConn := m.relay.HasConnection()
 	relayData := call.RelayData
+	// Só no PRIMEIRO accept fazemos o fan-out do "accepted_elsewhere" para os
+	// demais devices do destino (os que não atenderam) pararem de tocar.
+	var siblings []types.JID
+	if firstAccept {
+		for _, dev := range m.calleeDevices {
+			if dev.String() != peerJid.String() {
+				siblings = append(siblings, dev)
+			}
+		}
+	}
+	basePeer := call.PeerJid
 	m.mu.Unlock()
 
 	m.log.Info("remote accepted call", "call_id", call.CallID, "peer", peerJid.String(),
@@ -136,6 +162,15 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 
 	callID := call.CallID
 	creator := wanode.MustJID(call.CallCreator)
+	if len(siblings) > 0 {
+		elsewhere := signaling.BuildTerminateElsewhereStanza(wanode.MustJID(basePeer), callID, creator, siblings)
+		if err := m.sock.SendNode(ctx, elsewhere); err != nil {
+			m.log.Warn("accepted_elsewhere fanout failed; sibling devices may keep ringing",
+				"call_id", callID, "err", err)
+		} else {
+			m.log.Info("accepted_elsewhere sent to non-answering devices", "call_id", callID, "devices", len(siblings))
+		}
+	}
 	transport := waBinary.Node{
 		Tag:   "call",
 		Attrs: waBinary.Attrs{"to": peerJid, "id": signaling.GenerateCallStanzaID()},
@@ -162,7 +197,7 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 		m.mu.Lock()
 		if err := call.ApplyTransition(Transition{Type: TransitionMediaConnected}); err == nil {
 			m.emitState()
-			m.startSilenceKeepaliveLocked()
+			m.startMediaSendLoopLocked()
 			m.log.Info("call ACTIVE (media path established)", "call_id", call.CallID, "audio", m.codec != nil)
 		}
 		m.mu.Unlock()
@@ -229,7 +264,7 @@ func (m *CallManager) HandleCallAck(ctx context.Context, node *waBinary.Node) {
 		newSelf := media.GenerateSecureSsrc(call.CallID, ourDeviceJid, 0)
 		if newSelf != m.selfSsrc {
 			m.selfSsrc = newSelf
-			m.rtpSession = media.NewWhatsAppOpusSession(newSelf)
+			m.rtpSession = m.newAudioRtpLocked(newSelf)
 		}
 		if peer := firstPeerDevice(parsed.ParticipantJids, ourBase); peer != "" {
 			m.peerSsrcs = []uint32{media.GenerateSecureSsrc(call.CallID, ensureDeviceJid(peer), 0)}
@@ -262,12 +297,38 @@ func (m *CallManager) HandleCallTerminate(node *waBinary.Node) {
 		m.mu.Unlock()
 		return
 	}
+	sender := wanode.AttrString(node.Attrs, "from")
 	info := signaling.ExtractNodeInfo(node)
 	reason := core.EndCallReasonUserEnded
 	if info != nil {
 		if r := wanode.AttrString(info.InnerNode.Attrs, "reason"); r != "" {
 			reason = core.EndCallReason(r)
 		}
+	}
+
+	// Um device secundário hosted.lid vinculado à nossa própria conta pode responder
+	// ao offer de entrada com "uncallable" antes de o operador atender. O evento
+	// tipado CallReject do whatsmeow não preserva o atributo externo platform=capi,
+	// então usamos a identidade hosted.lid que permanece disponível. Esse reject
+	// descreve somente a incapacidade do sibling; o chamador original segue tocando.
+	if call.Direction == core.CallDirectionIncoming && call.CanAccept() &&
+		reason == core.EndCallReasonUncallable && info != nil &&
+		strings.HasSuffix(strings.ToLower(sender), "@hosted.lid") &&
+		sender != call.CallCreator && sender != call.PeerJid {
+		m.mu.Unlock()
+		m.log.Info("uncallable from secondary hosted device ignored",
+			"call_id", call.CallID, "from", sender, "call_creator", call.CallCreator)
+		return
+	}
+
+	// Depois de um accept, só o device que atendeu pode encerrar. Um sibling que
+	// continuou tocando eventualmente dá timeout e manda o próprio reject/terminate,
+	// que não pode derrubar a chamada já ativa.
+	if m.acceptedByJid != "" && sender != "" && sender != m.acceptedByJid && !call.IsEnded() {
+		m.mu.Unlock()
+		m.log.Info("terminate from non-answering device ignored",
+			"call_id", call.CallID, "from", sender, "accepted_by", m.acceptedByJid)
+		return
 	}
 	m.log.Info("call terminated by peer", "call_id", call.CallID, "reason", string(reason))
 	_ = call.ApplyTransition(Transition{Type: TransitionTerminated, Reason: reason})

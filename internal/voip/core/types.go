@@ -35,12 +35,14 @@ const (
 	EndCallReasonBusy         EndCallReason = "busy"
 	EndCallReasonCancelled    EndCallReason = "cancelled"
 	EndCallReasonFailed       EndCallReason = "failed"
+	EndCallReasonUncallable   EndCallReason = "uncallable"
 	EndCallReasonDoNotDisturb EndCallReason = "do_not_disturb"
 	EndCallReasonUnknown      EndCallReason = "unknown"
 )
 
 const (
 	PayloadTypeWhatsAppOpus = 120
+	PayloadTypeWhatsAppH264 = 97
 )
 
 const (

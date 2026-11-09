@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { PhoneCall } from "lucide-react";
 import { Dialer } from "@/components/domain/call/Dialer";
+import { GroupCallCard } from "@/components/domain/call/GroupCallCard";
 import { CallCard } from "@/components/domain/call/CallCard";
 import { OtherCallsList } from "@/components/domain/call/OtherCallsList";
 import { HistoryDrawer } from "@/components/domain/history/HistoryDrawer";
@@ -21,14 +22,15 @@ export const CallsPage = ({ sid }: { sid: string }) => {
   const others = sessionCalls.filter((c) => !isMine(c));
 
   return (
-    <div className="mx-auto max-w-3xl space-y-6">
+    <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-medium text-muted-foreground">
-          {mine.length} active call{mine.length === 1 ? "" : "s"}
+          {mine.length} {mine.length === 1 ? "chamada ativa" : "chamadas ativas"}
         </h2>
         <HistoryDrawer sid={sid} />
       </div>
       <Dialer sid={sid} />
+      <GroupCallCard sid={sid} />
       {mine.length > 0 ? (
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
           {mine.map((c) => (
@@ -38,8 +40,8 @@ export const CallsPage = ({ sid }: { sid: string }) => {
       ) : (
         <EmptyState
           icon={<PhoneCall className="h-6 w-6" />}
-          title="No active calls"
-          description="Dial a number above to start a call."
+          title="Nenhuma chamada ativa"
+          description="Disque um número acima para iniciar uma chamada."
         />
       )}
       <OtherCallsList calls={others} />

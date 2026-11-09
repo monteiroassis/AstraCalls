@@ -10,12 +10,31 @@ import (
 	"go.mau.fi/whatsmeow/types"
 )
 
+// Blobs de capability (ver=1) que o aparelho do peer lê para decidir tocar. Valores
+// alinhados ao WhatsApp Web atual (referência: meowcaller/whatsapp-rust). O byte 5
+// era 0xe4 (stale) — clientes atuais ignoravam a chamada em silêncio; passou a 0xe0.
 var (
-	capabilityOffer     = []byte{0x01, 0x05, 0xf7, 0x09, 0xe4, 0xbb, 0x07}
-	capabilityPreaccept = []byte{0x01, 0x05, 0xff, 0x09, 0xe4, 0xbb, 0x07}
+	capabilityOffer      = []byte{0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x13}
+	capabilityVideoOffer = []byte{0x01, 0x05, 0xf7, 0x09, 0xe0, 0xfa, 0x13}
+	capabilityPreaccept  = []byte{0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x07}
 )
 
-func BuildOfferStanza(ctx context.Context, sock core.VoipSocket, callID string, callKey []byte, peerJid types.JID, isVideo bool) (waBinary.Node, error) {
+// CapabilityOffer expõe a capability de offer (bytes) p/ o pacote call.
+var CapabilityOffer = capabilityOffer
+
+// CapabilityGroupOffer é a capability que o WhatsApp Web envia no offer de GRUPO
+// (capturada de uma chamada de grupo REAL do WhatsApp Web, 2026-10-03). Difere da de
+// 1:1 (f7...13) em 2 bytes (f5...53) — é o bit que diz ao servidor "este cliente faz
+// chamada de grupo". Usar a de 1:1 fazia o servidor recusar o offer de grupo com 427.
+var capabilityGroupOffer = []byte{0x01, 0x05, 0xf5, 0x09, 0xe0, 0xbb, 0x53}
+var CapabilityGroupOffer = capabilityGroupOffer
+
+// CapabilityGroupVideoOffer é a capability de chamada de grupo com VÍDEO (visto nos
+// group_updates reais: 0105f509e0fa53, difere da de áudio só no byte 5: fa vs bb).
+var capabilityGroupVideoOffer = []byte{0x01, 0x05, 0xf5, 0x09, 0xe0, 0xfa, 0x53}
+var CapabilityGroupVideoOffer = capabilityGroupVideoOffer
+
+func BuildOfferStanza(ctx context.Context, sock core.VoipSocket, callID string, callKey []byte, peerJid types.JID, isVideo bool) (waBinary.Node, []types.JID, error) {
 	creator := sock.OwnLID()
 	if creator.IsEmpty() {
 		creator = sock.OwnPN()
@@ -23,15 +42,15 @@ func BuildOfferStanza(ctx context.Context, sock core.VoipSocket, callID string, 
 
 	rawDevices, err := sock.GetUSyncDevices(ctx, []types.JID{peerJid})
 	if err != nil {
-		return waBinary.Node{}, fmt.Errorf("usync devices: %w", err)
+		return waBinary.Node{}, nil, fmt.Errorf("usync devices: %w", err)
 	}
 	if err := sock.AssertSessions(ctx, rawDevices, false); err != nil {
-		return waBinary.Node{}, fmt.Errorf("assert sessions: %w", err)
+		return waBinary.Node{}, nil, fmt.Errorf("assert sessions: %w", err)
 	}
 
 	destinations, includeDeviceIdentity, err := sock.CreateParticipantNodes(ctx, rawDevices, callKey, waBinary.Attrs{"count": "0"})
 	if err != nil {
-		return waBinary.Node{}, fmt.Errorf("participant nodes: %w", err)
+		return waBinary.Node{}, nil, fmt.Errorf("participant nodes: %w", err)
 	}
 
 	var offerContent []waBinary.Node
@@ -46,9 +65,13 @@ func BuildOfferStanza(ctx context.Context, sock core.VoipSocket, callID string, 
 		waBinary.Node{Tag: "audio", Attrs: waBinary.Attrs{"enc": "opus", "rate": "8000"}},
 		waBinary.Node{Tag: "audio", Attrs: waBinary.Attrs{"enc": "opus", "rate": "16000"}},
 	)
+	capability := capabilityOffer
 	if isVideo {
+		// Formato atual do WhatsApp Web: enc "h.264" (com ponto), dec "H264" (maiúsc.),
+		// SEM o atributo legado "orientation". E capability de vídeo próprio.
+		capability = capabilityVideoOffer
 		offerContent = append(offerContent, waBinary.Node{Tag: "video", Attrs: waBinary.Attrs{
-			"enc": "vp8", "dec": "vp8", "orientation": "0",
+			"enc": "h.264", "dec": "H264",
 			"screen_width": "1920", "screen_height": "1080", "device_orientation": "0",
 		}})
 	}
@@ -56,7 +79,7 @@ func BuildOfferStanza(ctx context.Context, sock core.VoipSocket, callID string, 
 	// confirmado: preaccept recebido). Trocar por <enc> direto foi regressão.
 	offerContent = append(offerContent,
 		waBinary.Node{Tag: "net", Attrs: waBinary.Attrs{"medium": "3"}},
-		waBinary.Node{Tag: "capability", Attrs: waBinary.Attrs{"ver": "1"}, Content: capabilityOffer},
+		waBinary.Node{Tag: "capability", Attrs: waBinary.Attrs{"ver": "1"}, Content: capability},
 		waBinary.Node{Tag: "destination", Content: destinations},
 		waBinary.Node{Tag: "encopt", Attrs: waBinary.Attrs{"keygen": "2"}},
 	)
@@ -74,7 +97,7 @@ func BuildOfferStanza(ctx context.Context, sock core.VoipSocket, callID string, 
 			Attrs:   waBinary.Attrs{"call-id": callID, "call-creator": creator},
 			Content: offerContent,
 		}},
-	}, nil
+	}, rawDevices, nil
 }
 
 func BuildAcceptStanza(ctx context.Context, sock core.VoipSocket, callID string, callKey []byte, peerJid, callCreator types.JID, isVideo bool) (waBinary.Node, error) {
@@ -104,7 +127,7 @@ func BuildAcceptStanza(ctx context.Context, sock core.VoipSocket, callID string,
 		}
 	}
 	if isVideo {
-		acceptContent = append(acceptContent, waBinary.Node{Tag: "video", Attrs: waBinary.Attrs{"enc": "vp8"}})
+		acceptContent = append(acceptContent, waBinary.Node{Tag: "video", Attrs: waBinary.Attrs{"enc": "h264"}})
 	}
 
 	return waBinary.Node{
@@ -141,11 +164,41 @@ func BuildTerminateStanza(peerJid types.JID, callID string, callCreator types.JI
 	})
 }
 
-func BuildRejectStanza(peerJid types.JID, callID string, callCreator types.JID) waBinary.Node {
+// BuildTerminateElsewhereStanza avisa os dispositivos do destino que NÃO
+// atenderam para pararem de tocar. Quando um device companheiro do destino
+// atende, quem originou a chamada precisa fazer esse fan-out — senão os demais
+// devices do destino ficam tocando até o timeout (e o reject tardio deles
+// chegaria no meio da chamada já ativa).
+func BuildTerminateElsewhereStanza(peerJid types.JID, callID string, callCreator types.JID, devices []types.JID) waBinary.Node {
+	tos := make([]waBinary.Node, len(devices))
+	for i, jid := range devices {
+		tos[i] = waBinary.Node{Tag: "to", Attrs: waBinary.Attrs{"jid": jid}}
+	}
 	return callWrap(peerJid, waBinary.Node{
-		Tag:   "reject",
-		Attrs: waBinary.Attrs{"call-id": callID, "call-creator": callCreator},
+		Tag:     "terminate",
+		Attrs:   waBinary.Attrs{"call-id": callID, "call-creator": callCreator, "reason": "accepted_elsewhere"},
+		Content: []waBinary.Node{{Tag: "destination", Content: tos}},
 	})
+}
+
+// BuildRejectStanza monta o <reject> enviado ao chamador quando recusamos uma
+// chamada recebida. Replica EXATAMENTE o RejectCall de referência do whatsmeow:
+// o <call> leva from=ownID e to=callFrom (ambos ToNonAD), e o <reject> leva
+// call-creator=callFrom e count="0". Sem o from e o count o aparelho do chamador
+// não registra a recusa e continua tocando até o timeout.
+func BuildRejectStanza(peerJid types.JID, callID string, callCreator, ownJid types.JID) waBinary.Node {
+	return waBinary.Node{
+		Tag: "call",
+		Attrs: waBinary.Attrs{
+			"id":   GenerateCallStanzaID(),
+			"from": ownJid.ToNonAD(),
+			"to":   peerJid.ToNonAD(),
+		},
+		Content: []waBinary.Node{{
+			Tag:   "reject",
+			Attrs: waBinary.Attrs{"call-id": callID, "call-creator": callCreator.ToNonAD(), "count": "0"},
+		}},
+	}
 }
 
 func BuildPreacceptStanza(peerJid types.JID, callID string, callCreator types.JID) waBinary.Node {

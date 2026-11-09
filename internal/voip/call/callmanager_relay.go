@@ -1,6 +1,9 @@
 package call
 
 import (
+	"math"
+	"sync/atomic"
+
 	"wacalls/internal/voip/core"
 	"wacalls/internal/voip/transport"
 )
@@ -8,11 +11,14 @@ import (
 type RelayTransport interface {
 	SetSsrc(ssrc uint32)
 	SetSubscriptionSsrc(ssrc uint32)
+	SetStreamSsrcs(selfSsrcs, peerSsrcs []uint32)
+	SetGroupAllocate(fn func(ip string, port int, rawToken, key []byte) []byte)
 	SetOnConnected(fn func(ip string, port int))
 	SetOnReceive(fn func(data []byte))
 	ResendSubscriptions()
 	ConfigureRelays(relays []transport.RelayConfig)
 	Broadcast(data []byte)
+	BufferedAmount() uint64
 	HasConnection() bool
 	ConnectedCount() int
 	Cleanup()
@@ -26,7 +32,7 @@ func (m *CallManager) onRelayConnected() {
 	if call != nil && call.StateData.State == core.CallStateConnecting {
 		if err := call.ApplyTransition(Transition{Type: TransitionMediaConnected}); err == nil {
 			m.emitState()
-			m.startSilenceKeepaliveLocked()
+			m.startMediaSendLoopLocked()
 			m.log.Info("relay connected → active", "call_id", call.CallID)
 		}
 	}
@@ -77,24 +83,54 @@ func (m *CallManager) connectRelays(endpoints []core.RelayEndpoint) {
 
 func (m *CallManager) cleanupMedia() {
 	m.mu.Lock()
+	m.logMediaStatsLocked()
 	codec := m.codec
 	m.codec = nil
-	if m.keepaliveStop != nil {
-		close(m.keepaliveStop)
-		m.keepaliveStop = nil
+	if m.sendLoopStop != nil {
+		close(m.sendLoopStop)
+		m.sendLoopStop = nil
 	}
 	m.rtpSession = nil
 	m.srtpSession = nil
+	m.peerCallKey = nil
+	m.mediaClock = nil
 	m.firstPacketSent = false
 	m.initialTransportSent = false
 	m.outgoingPreacceptSent = false
 	m.actualPeerSet = false
-	m.encodeBuf = nil
-	m.encodeBufPos = 0
+	m.captureBuf = nil
+	m.audioTimelineSet = false
+	m.audioPlayedSamples = 0
 	m.mu.Unlock()
 
+	m.video.Reset()
 	m.relay.Cleanup()
 	if codec != nil {
 		codec.Close()
 	}
+}
+
+// logMediaStatsLocked registra (INFO) o resumo da mídia de ENTRADA da chamada que
+// termina e zera os contadores. Explica "não ouço o cliente": rtp=0 → relay não
+// entrega (assinatura de SSRC); decoded>0 com rms≈0 → chave SRTP errada ou peer mudo.
+func (m *CallManager) logMediaStatsLocked() {
+	rtp := atomic.SwapUint64(&m.rtpRecvN, 0)
+	audio := atomic.SwapUint64(&m.audioRtpN, 0)
+	unprot := atomic.SwapUint64(&m.unprotectErrN, 0)
+	decoded := atomic.SwapUint64(&m.recvDiagN, 0)
+	rms := 0.0
+	if m.peerEnergySamples > 0 {
+		rms = math.Sqrt(m.peerEnergySum / float64(m.peerEnergySamples))
+	}
+	m.peerEnergySum, m.peerEnergySamples = 0, 0
+	if m.currentCall == nil && rtp == 0 && decoded == 0 {
+		return
+	}
+	callID := ""
+	if m.currentCall != nil {
+		callID = m.currentCall.CallID
+	}
+	m.log.Info("call media stats (entrada)", "call_id", callID, "rtp_pkts", rtp, "audio_pkts", audio,
+		"srtp_errors", unprot, "decoded_frames", decoded, "peer_rms", math.Round(rms*10000)/10000,
+		"accepted_by", m.acceptedByJid)
 }

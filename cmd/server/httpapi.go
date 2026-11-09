@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"wacalls/internal/voip/core"
 	"wacalls/internal/voip/media"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -17,25 +20,187 @@ func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/config", s.handleConfig)
+	// Credencial de widget para quem tem a chave-mestra (não entram em widgetAllowed,
+	// então SÓ a chave-mestra acessa). widget-key = estática por instância; widget-tokens
+	// = token efêmero escopado por conta (recomendado).
+	mux.HandleFunc("GET /api/widget-key", s.handleWidgetKey)
+	mux.HandleFunc("POST /api/widget-tokens", s.handleWidgetToken)
 	mux.HandleFunc("GET /api/sessions", s.handleSessionList)
 	mux.HandleFunc("POST /api/sessions", s.handleSessionCreate)
 	mux.HandleFunc("GET /api/sessions/{sid}/calls", s.handleSessionCalls)
+	mux.HandleFunc("GET /api/sessions/{sid}/restriction-status", s.handleRestrictionStatus)
+	mux.HandleFunc("GET /api/sessions/{sid}/capping", s.handleMessageCapping)
 	mux.HandleFunc("DELETE /api/sessions/{sid}", s.handleSessionDelete)
 	mux.HandleFunc("POST /api/sessions/{sid}/logout", s.handleSessionLogout)
 	mux.HandleFunc("POST /api/sessions/{sid}/pair", s.handleSessionPair)
+	mux.HandleFunc("POST /api/sessions/{sid}/pair-code", s.handleSessionPairCode)
+	mux.HandleFunc("POST /api/sessions/{sid}/pair-passkey", s.handlePairPasskey)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls", s.handleStartCall)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/fake", s.handleFakeCall)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/group", s.handleStartGroupCall)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/group/end", s.handleEndGroupCall)
+	mux.HandleFunc("GET /api/sessions/{sid}/calls/group/ws", s.handleGroupWSBridge)
+	mux.HandleFunc("GET /api/sessions/{sid}/calls/group/video-ws", s.handleGroupVideoWS)
+	mux.HandleFunc("GET /api/sessions/{sid}/calls/group/roster", s.handleGroupRoster)
+
+	// Gateway SIP (modelo Wavoip): status global e credenciais por sessão.
+	mux.HandleFunc("GET /api/sip/status", s.handleSIPStatus)
+	mux.HandleFunc("GET /api/sessions/{sid}/sip", s.handleSIPConfig)
+	mux.HandleFunc("POST /api/sessions/{sid}/sip", s.handleSIPConfig)
+	mux.HandleFunc("GET /api/sessions/{sid}/sip-ext", s.handleSIPExtConfig)
+	mux.HandleFunc("POST /api/sessions/{sid}/sip-ext", s.handleSIPExtConfig)
+	mux.HandleFunc("GET /api/sessions/{sid}/sip-agent", s.handleSIPAgentConfig)
+	mux.HandleFunc("POST /api/sessions/{sid}/sip-agent", s.handleSIPAgentConfig)
+
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/webrtc", s.handleWebRTC)
+	// Rota WebSocket de mídia — funciona atrás de proxy reverso HTTP (Cloudflare etc.)
+	// O browser envia/recebe PCM Int16 LE 16 kHz via WSS/443 em vez de WebRTC/UDP.
+	mux.HandleFunc("GET /api/sessions/{sid}/calls/{id}/ws", s.handleWSBridge)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/accept", s.handleAccept)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/reject", s.handleReject)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/video/{action}", s.handleCallVideo)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/hold", s.handleHold)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/resume", s.handleResume)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/mute", s.handleCallMute)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/hand", s.handleCallHand)
+	// espiar (escuta em tempo real), volume e silenciar o toque — ver spy.go
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/spy", s.handleSpyWebRTC)
+	mux.HandleFunc("GET /api/sessions/{sid}/calls/{id}/spy", s.handleSpyList)
+	mux.HandleFunc("GET /api/sessions/{sid}/calls/{id}/spy/ws", s.handleSpyWS)
+	mux.HandleFunc("DELETE /api/sessions/{sid}/calls/{id}/spy/{spyId}", s.handleSpyDelete)
+	mux.HandleFunc("GET /api/sessions/{sid}/calls/{id}/volume", s.handleCallVolume)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/volume", s.handleCallVolume)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/silence", s.handleCallSilence)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/transfer", s.handleTransfer)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/pickup", s.handlePickup)
 	mux.HandleFunc("DELETE /api/sessions/{sid}/calls/{id}", s.handleEndCall)
 	mux.HandleFunc("GET /api/sessions/{sid}/history", s.handleHistory)
 
 	// Mensageria (whatsmeow)
+	mux.HandleFunc("GET /api/sessions/{sid}/messages/new-message-id", s.handleNewMessageID)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/text", s.handleSendText)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/disappearing", s.handleSendDisappearing)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/image", s.handleSendImage)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/audio", s.handleSendAudio)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/video", s.handleSendVideo)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/ptv", s.handleSendPtv)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/forward", s.handleForward)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/buttons", s.handleSendButtons)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/list", s.handleSendList)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/interactive", s.handleSendInteractive)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/carousel", s.handleSendCarousel)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/catalog", s.handleSendCatalog)
+	mux.HandleFunc("POST /api/sessions/{sid}/meta-ai", s.handleMetaAI)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/form", s.handleSendForm)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/native-form", s.handleSendNativeForm)
+	mux.HandleFunc("GET /api/sessions/{sid}/native-forms", s.handleListNativeForms)
+	mux.HandleFunc("POST /api/sessions/{sid}/schedule", s.handleSchedule)
+	mux.HandleFunc("GET /api/sessions/{sid}/schedule", s.handleListScheduled)
+	mux.HandleFunc("DELETE /api/sessions/{sid}/schedule/{id}", s.handleCancelScheduled)
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/document", s.handleSendDocument)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/sticker", s.handleSendSticker)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/location", s.handleSendLocation)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/contact", s.handleSendContact)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/poll", s.handleSendPoll)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/pix", s.handleSendPix)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/product", s.handleSendProduct)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/product-native", s.handleSendProductNative)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/link-preview", s.handleSendLinkPreview)
+	mux.HandleFunc("PUT /api/sessions/{sid}/messages/react", s.handleReact)
+	mux.HandleFunc("PUT /api/sessions/{sid}/messages/edit", s.handleEditMessage)
+	mux.HandleFunc("DELETE /api/sessions/{sid}/messages", s.handleDeleteMessage)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/seen", s.handleMarkSeen)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/typing", s.handleTyping)
+	// Baixar os bytes de uma mídia RECEBIDA (imagem/áudio/vídeo/documento/sticker)
+	mux.HandleFunc("GET /api/sessions/{sid}/messages/{id}/media", s.handleGetMedia)
+
+	// Contatos (whatsmeow)
+	mux.HandleFunc("GET /api/sessions/{sid}/contacts/check", s.handleCheckNumber)
+	mux.HandleFunc("GET /api/sessions/{sid}/contacts", s.handleListContacts)
+	mux.HandleFunc("GET /api/sessions/{sid}/contacts/{jid}", s.handleContactInfo)
+	mux.HandleFunc("GET /api/sessions/{sid}/contacts/{jid}/picture", s.handleContactPicture)
+	mux.HandleFunc("POST /api/sessions/{sid}/contacts/{jid}/block", s.handleBlock(true))
+	mux.HandleFunc("POST /api/sessions/{sid}/contacts/{jid}/unblock", s.handleBlock(false))
+	mux.HandleFunc("GET /api/sessions/{sid}/blocklist", s.handleBlocklist)
+
+	// Grupos (whatsmeow)
+	mux.HandleFunc("POST /api/sessions/{sid}/communities", s.handleCreateCommunity)
+	mux.HandleFunc("GET /api/sessions/{sid}/communities", s.handleListCommunities)
+	mux.HandleFunc("GET /api/sessions/{sid}/communities/{cid}", s.handleCommunityInfo)
+	mux.HandleFunc("GET /api/sessions/{sid}/communities/{cid}/groups", s.handleCommunityGroups)
+	mux.HandleFunc("POST /api/sessions/{sid}/communities/{cid}/groups", s.handleCommunityCreateGroup)
+	mux.HandleFunc("POST /api/sessions/{sid}/communities/{cid}/groups/link", s.handleCommunityLink(true))
+	mux.HandleFunc("POST /api/sessions/{sid}/communities/{cid}/groups/unlink", s.handleCommunityLink(false))
+	mux.HandleFunc("GET /api/sessions/{sid}/communities/{cid}/participants", s.handleCommunityParticipants)
+	mux.HandleFunc("POST /api/sessions/{sid}/communities/{cid}/participants/add", s.handleCommunityAddParticipants)
+	mux.HandleFunc("POST /api/sessions/{sid}/groups", s.handleCreateGroup)
+	mux.HandleFunc("GET /api/sessions/{sid}/groups", s.handleListGroups)
+	mux.HandleFunc("POST /api/sessions/{sid}/groups/join", s.handleJoinGroup)
+	mux.HandleFunc("GET /api/sessions/{sid}/groups/join-info", s.handleGroupJoinInfo)
+	mux.HandleFunc("GET /api/sessions/{sid}/groups/{gid}", s.handleGroupInfo)
+	mux.HandleFunc("POST /api/sessions/{sid}/groups/{gid}/leave", s.handleLeaveGroup)
+	mux.HandleFunc("POST /api/sessions/{sid}/groups/{gid}/status", s.handleGroupStatus)
+	mux.HandleFunc("GET /api/sessions/{sid}/groups/{gid}/participants", s.handleGroupParticipants)
+	mux.HandleFunc("POST /api/sessions/{sid}/groups/{gid}/history/share", s.handleGroupHistoryShare)
+	mux.HandleFunc("GET /api/sessions/{sid}/abprops", s.handleABProps)
+	mux.HandleFunc("POST /api/sessions/{sid}/groups/{gid}/participants/add", s.handleGroupParticipantChange(whatsmeow.ParticipantChangeAdd))
+	mux.HandleFunc("POST /api/sessions/{sid}/groups/{gid}/participants/remove", s.handleGroupParticipantChange(whatsmeow.ParticipantChangeRemove))
+	mux.HandleFunc("POST /api/sessions/{sid}/groups/{gid}/participants/promote", s.handleGroupParticipantChange(whatsmeow.ParticipantChangePromote))
+	mux.HandleFunc("POST /api/sessions/{sid}/groups/{gid}/participants/demote", s.handleGroupParticipantChange(whatsmeow.ParticipantChangeDemote))
+	mux.HandleFunc("PUT /api/sessions/{sid}/groups/{gid}/subject", s.handleGroupSubject)
+	mux.HandleFunc("PUT /api/sessions/{sid}/groups/{gid}/description", s.handleGroupDescription)
+	mux.HandleFunc("PUT /api/sessions/{sid}/groups/{gid}/picture", s.handleGroupPicture)
+	mux.HandleFunc("GET /api/sessions/{sid}/groups/{gid}/invite", s.handleGroupInvite)
+	mux.HandleFunc("POST /api/sessions/{sid}/groups/{gid}/invite/revoke", s.handleGroupInviteRevoke)
+	mux.HandleFunc("PUT /api/sessions/{sid}/groups/{gid}/settings/announce", s.handleGroupAnnounce)
+	mux.HandleFunc("PUT /api/sessions/{sid}/groups/{gid}/settings/locked", s.handleGroupLocked)
+	mux.HandleFunc("PUT /api/sessions/{sid}/groups/{gid}/settings/approval", s.handleGroupApprovalMode)
+	mux.HandleFunc("PUT /api/sessions/{sid}/groups/{gid}/settings/add-mode", s.handleGroupAddMode)
+	mux.HandleFunc("GET /api/sessions/{sid}/groups/{gid}/requests", s.handleGroupRequests)
+	mux.HandleFunc("POST /api/sessions/{sid}/groups/{gid}/requests/approve", s.handleGroupRequestChange(whatsmeow.ParticipantChangeApprove))
+	mux.HandleFunc("POST /api/sessions/{sid}/groups/{gid}/requests/reject", s.handleGroupRequestChange(whatsmeow.ParticipantChangeReject))
+
+	// Canais / Newsletters (whatsmeow)
+	mux.HandleFunc("GET /api/sessions/{sid}/channels", s.handleListChannels)
+	mux.HandleFunc("GET /api/sessions/{sid}/channels/{id}", s.handleChannelInfo)
+	mux.HandleFunc("GET /api/sessions/{sid}/channels/{id}/messages", s.handleChannelMessages)
+	mux.HandleFunc("POST /api/sessions/{sid}/channels/{id}/follow", s.handleChannelFollow(true))
+	mux.HandleFunc("POST /api/sessions/{sid}/channels/{id}/unfollow", s.handleChannelFollow(false))
+	mux.HandleFunc("POST /api/sessions/{sid}/channels/{id}/mute", s.handleChannelMute(true))
+	mux.HandleFunc("POST /api/sessions/{sid}/channels/{id}/unmute", s.handleChannelMute(false))
+
+	// Presença
+	mux.HandleFunc("POST /api/sessions/{sid}/presence", s.handleSetPresence)
+	mux.HandleFunc("POST /api/sessions/{sid}/presence/{jid}/subscribe", s.handleSubscribePresence)
+
+	// Perfil próprio
+	mux.HandleFunc("GET /api/sessions/{sid}/profile", s.handleGetProfile)
+	mux.HandleFunc("PUT /api/sessions/{sid}/profile/status", s.handleSetProfileStatus)
+	mux.HandleFunc("GET /api/sessions/{sid}/profile/qr", s.handleContactQR)
+
+	// Privacidade da conta
+	mux.HandleFunc("GET /api/sessions/{sid}/privacy", s.handleGetPrivacy)
+	mux.HandleFunc("PUT /api/sessions/{sid}/privacy", s.handleSetPrivacy)
+	mux.HandleFunc("GET /api/sessions/{sid}/privacy/status", s.handleGetStatusPrivacy)
+
+	// Mensagens temporárias (disappearing)
+	mux.HandleFunc("PUT /api/sessions/{sid}/disappearing", s.handleSetDefaultDisappearing)
+	mux.HandleFunc("PUT /api/sessions/{sid}/chats/{chatId}/disappearing", s.handleSetChatDisappearing)
+
+	// Perfil comercial (business) de um contato
+	mux.HandleFunc("GET /api/sessions/{sid}/contacts/{jid}/business", s.handleBusinessProfile)
+
+	// Status / Stories
+	mux.HandleFunc("POST /api/sessions/{sid}/status/text", s.handleStatusText)
+	mux.HandleFunc("POST /api/sessions/{sid}/status/image", s.handleStatusImage)
+	mux.HandleFunc("POST /api/sessions/{sid}/status/video", s.handleStatusVideo)
+	mux.HandleFunc("POST /api/sessions/{sid}/status/audio", s.handleStatusAudio)
+
+	// Histórico de conversas/mensagens
+	mux.HandleFunc("GET /api/sessions/{sid}/chats", s.handleListChats)
+	mux.HandleFunc("GET /api/sessions/{sid}/chats/{chatId}/messages", s.handleChatMessages)
+	mux.HandleFunc("GET /api/sessions/{sid}/messages/search", s.handleSearchMessages)
+	mux.HandleFunc("GET /api/sessions/{sid}/messages", s.handleQueryMessages)
 
 	// Webhook por sessão (recebimento -> Chatwoot etc.)
 	mux.HandleFunc("POST /api/sessions/{sid}/webhook", s.handleSetWebhook)
@@ -47,18 +212,79 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/sessions/{sid}/chatwoot", s.handleGetChatwoot)
 	mux.HandleFunc("DELETE /api/sessions/{sid}/chatwoot", s.handleDeleteChatwoot)
 	mux.HandleFunc("POST /api/sessions/{sid}/chatwoot/webhook", s.handleChatwootWebhook)
+	mux.HandleFunc("POST /api/sessions/{sid}/chatwoot/import-history", s.handleImportHistoryNow)
 	mux.HandleFunc("GET /api/chatwoot/resolve", s.handleChatwootResolve)
+	// Abrir sob demanda uma conversa de grupo/canal no Chatwoot
+	mux.HandleFunc("POST /api/sessions/{sid}/chatwoot/groups/{gid}/open", s.handleChatwootOpenGroup)
+	mux.HandleFunc("POST /api/sessions/{sid}/chatwoot/channels/{id}/open", s.handleChatwootOpenChannel)
+
+	// Gravação de chamadas (opt-in por sessão)
+	mux.HandleFunc("GET /api/sessions/{sid}/recording", s.handleGetRecording)
+	mux.HandleFunc("PUT /api/sessions/{sid}/recording", s.handleSetRecording)
+	// Proxy de saída por sessão (http/https/socks5)
+	mux.HandleFunc("GET /api/sessions/{sid}/proxy", s.handleGetProxy)
+	mux.HandleFunc("PUT /api/sessions/{sid}/proxy", s.handleSetProxy)
+	// Votar numa enquete recebida
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/poll-vote", s.handlePollVote)
+	// Responder (RSVP) um evento recebido
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/event", s.handleSendEvent)
+	// Disparo (blast) com pacing anti-ban.
+	mux.HandleFunc("POST /api/sessions/{sid}/blast", s.handleBlast)
+	mux.HandleFunc("GET /api/sessions/{sid}/blasts", s.handleBlastList)
+	mux.HandleFunc("GET /api/sessions/{sid}/blasts/{id}", s.handleBlastGet)
+	mux.HandleFunc("POST /api/sessions/{sid}/blasts/{id}/cancel", s.handleBlastCancel)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/event-response", s.handleEventResponse)
+	// Disparo em massa de ligações com áudio pré-gravado
+	mux.HandleFunc("POST /api/sessions/{sid}/broadcast", s.handleBroadcast)
+	mux.HandleFunc("GET /api/sessions/{sid}/broadcast/{cid}", s.handleBroadcastStatus)
+	// MP3 finalizado — rota pública (fora de /api/, sem API key): o id é
+	// não-enumerável e atua como capability.
+	mux.HandleFunc("GET /recordings/{id}", s.handleRecording)
+
+	// Formulários (webview) — rotas PÚBLICAS (fora de /api/): o celular do
+	// cliente abre a webview sem API key; o token assinado é a capability.
+	mux.HandleFunc("GET /forms/{token}", s.handleFormPage)
+	mux.HandleFunc("POST /forms/{token}/submit", s.handleFormSubmit)
+
+	// Observabilidade (aditivo, sem auth — fora de /api/): probes + métricas.
+	mux.HandleFunc("GET /livez", s.handleLivez)
+	mux.HandleFunc("GET /readyz", s.handleLivez)
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 
+	// MCP (Model Context Protocol) para agentes de IA: ver mcp.go. /api/mcp usa a
+	// chave-mestra; /mcp e /mcp/{key} usam as chaves por sessão (mcpkeys.go).
+	mux.HandleFunc("/api/mcp", s.handleMCP)
+	mux.HandleFunc("/mcp", s.handleMCPScoped)
+	mux.HandleFunc("/mcp/{key}", s.handleMCPScoped)
+	mux.HandleFunc("GET /api/sessions/{sid}/mcp-keys", s.handleListMCPKeys)
+	mux.HandleFunc("POST /api/sessions/{sid}/mcp-keys", s.handleCreateMCPKey)
+	mux.HandleFunc("DELETE /api/sessions/{sid}/mcp-keys/{kid}", s.handleDeleteMCPKey)
+
+	// Confiabilidade de entrega do webhook de sessão (circuit breaker + DLQ).
+	mux.HandleFunc("GET /api/sessions/{sid}/webhooks/status", s.handleWebhookStatus)
+	mux.HandleFunc("GET /api/sessions/{sid}/webhooks/dlq", s.handleWebhookDLQ)
+	mux.HandleFunc("POST /api/sessions/{sid}/webhooks/dlq/{id}/replay", s.handleWebhookDLQReplay)
+	mux.HandleFunc("POST /api/sessions/{sid}/webhooks/reenable", s.handleWebhookReenable)
+	// Vários webhooks por sessão (o "default" é o mesmo da rota /webhook acima).
+	mux.HandleFunc("GET /api/sessions/{sid}/webhooks", s.handleListWebhooks)
+	mux.HandleFunc("POST /api/sessions/{sid}/webhooks", s.handleCreateWebhook)
+	mux.HandleFunc("PUT /api/sessions/{sid}/webhooks/{wid}", s.handleUpdateWebhook)
+	mux.HandleFunc("DELETE /api/sessions/{sid}/webhooks/{wid}", s.handleDeleteWebhookByID)
+	mux.HandleFunc("POST /api/sessions/{sid}/webhooks/{wid}/test", s.handleTestWebhook)
+
 	if s.staticDir != "" {
 		if _, err := os.Stat(s.staticDir); err == nil {
-			mux.Handle("/", http.FileServer(http.Dir(s.staticDir)))
+			mux.Handle("/", s.staticFileHandler())
 		}
 	}
+	s.apiMux = mux
 	var handler http.Handler = mux
 	if key := os.Getenv("WACALLS_API_KEY"); key != "" {
-		handler = withAuth(handler, key)
+		handler = withAuth(handler, key, os.Getenv("WACALLS_WIDGET_KEY"), func(sid string) (int, int) {
+			return s.sessions.accountIDForSession(sid), s.sessions.inboxIDForSession(sid)
+		})
 	}
 	return withCORS(handler)
 }
@@ -66,8 +292,8 @@ func (s *server) routes() http.Handler {
 func withCORS(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Client-Id, X-API-Key")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Client-Id, X-API-Key, Authorization, Mcp-Session-Id, Mcp-Protocol-Version")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -76,24 +302,166 @@ func withCORS(h http.Handler) http.Handler {
 	})
 }
 
-// withAuth protege as rotas /api/* com uma API key (header X-API-Key ou ?apiKey=).
+// withAuth protege as rotas /api/* com uma API key (header X-API-Key,
+// Authorization: Bearer ou ?apiKey=).
 // Exceções: o webhook do Chatwoot (chamado externamente pelo próprio Chatwoot)
 // e os arquivos estáticos do painel (precisam carregar a tela de login).
-func withAuth(h http.Handler, key string) http.Handler {
+//
+// Segurança (issue #10): a chave-MESTRA (key) libera tudo; a chave de WIDGET
+// (widgetKey, opcional) libera SÓ a superfície que o widget do Chatwoot precisa
+// (resolve, eventos SSE e operações de chamada). Como o widget expõe a chave no
+// data-api-key/URL do EventSource, usar a de widget limita o estrago se ela
+// vazar: quem a pega NÃO consegue listar/apagar sessões, mandar mensagens nem
+// mexer na config do Chatwoot.
+//
+// sessionScope (opcional) devolve conta/caixa do Chatwoot de uma sessão: com ele, um
+// token de widget só opera chamadas das sessões da própria conta (e caixa, se fixada).
+func withAuth(h http.Handler, key, widgetKey string, sessionScope func(sid string) (acct, inbox int)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		guarded := strings.HasPrefix(p, "/api/") && !strings.HasSuffix(p, "/chatwoot/webhook")
 		if guarded {
-			got := r.Header.Get("X-API-Key")
-			if got == "" {
-				got = r.URL.Query().Get("apiKey")
-			}
-			if got != key {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			got := requestAPIKey(r)
+			if got == key {
+				h.ServeHTTP(w, r) // chave-mestra: libera tudo
 				return
 			}
+			// Superfície de widget: chave estática (por instância) OU token efêmero (por conta).
+			if widgetAllowed(r) {
+				if widgetKey != "" && got == widgetKey {
+					// sem conta o SSE viraria "painel admin" e receberia tudo (QR inclusive).
+					if p == "/api/events" && asInt(r.URL.Query().Get("accountId")) == 0 && accountFromClientID(clientID(r)) == 0 {
+						writeJSON(w, http.StatusForbidden, map[string]string{"error": "account_required"})
+						return
+					}
+					h.ServeHTTP(w, r)
+					return
+				}
+				if claims, ok := parseWidgetToken(got); ok {
+					// escopo de conta no SSE: um token só recebe eventos da sua própria conta.
+					if p == "/api/events" && !widgetTokenAccountMatches(r, claims) {
+						writeJSON(w, http.StatusForbidden, map[string]string{"error": "account_scope_mismatch"})
+						return
+					}
+					if p == "/api/chatwoot/resolve" && asInt(r.URL.Query().Get("account_id")) != claims.AccountID {
+						writeJSON(w, http.StatusForbidden, map[string]string{"error": "account_scope_mismatch"})
+						return
+					}
+					// e só opera chamadas de sessões da própria conta/caixa.
+					if sid := sessionIDFromPath(p); sid != "" && sessionScope != nil {
+						acct, inbox := sessionScope(sid)
+						if acct != claims.AccountID || (claims.InboxID > 0 && inbox != claims.InboxID) {
+							writeJSON(w, http.StatusForbidden, map[string]string{"error": "session_scope_mismatch"})
+							return
+						}
+					}
+					h.ServeHTTP(w, r)
+					return
+				}
+			}
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
 		}
 		h.ServeHTTP(w, r)
+	})
+}
+
+// sessionIDFromPath devolve o {sid} de /api/sessions/{sid}/... ("" se não for rota de sessão).
+func sessionIDFromPath(p string) string {
+	rest, ok := strings.CutPrefix(p, "/api/sessions/")
+	if !ok {
+		return ""
+	}
+	sid, _, _ := strings.Cut(rest, "/")
+	return sid
+}
+
+// requestAPIKey extrai a chave da requisição (X-API-Key, Bearer ou ?apiKey=).
+func requestAPIKey(r *http.Request) string {
+	got := r.Header.Get("X-API-Key")
+	if got == "" {
+		got, _ = strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	}
+	if got == "" {
+		got = r.URL.Query().Get("apiKey")
+	}
+	return got
+}
+
+// eventInboxes lê as caixas (inbox) do Chatwoot que o assinante do SSE atende:
+// ?inboxIds=1,2 (ou ?inboxId=1). Um token de widget com caixa fixa SEMPRE fica
+// restrito a ela, mesmo que a query peça outras. nil = todas as caixas da conta.
+func eventInboxes(r *http.Request) map[int]bool {
+	if c, ok := parseWidgetToken(requestAPIKey(r)); ok && c.InboxID > 0 {
+		return map[int]bool{c.InboxID: true}
+	}
+	q := r.URL.Query()
+	raw := q.Get("inboxIds")
+	if raw == "" {
+		raw = q.Get("inboxId")
+	}
+	if raw == "" {
+		return nil
+	}
+	// lista sem nenhum id válido (ex.: "0", agente sem caixa) = não recebe nada.
+	out := map[int]bool{}
+	for _, p := range strings.Split(raw, ",") {
+		if id := asInt(strings.TrimSpace(p)); id > 0 {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+// widgetAllowed diz se a rota faz parte da superfície mínima do widget do
+// Chatwoot — a única coisa que a chave de widget (WACALLS_WIDGET_KEY) autoriza.
+func widgetAllowed(r *http.Request) bool {
+	p := r.URL.Path
+	switch {
+	case p == "/api/events": // SSE de chamadas
+		return true
+	case r.Method == http.MethodGet && p == "/api/chatwoot/resolve": // nome/telefone do contato
+		return true
+	// operações de chamada: iniciar, atender/recusar, webrtc, vídeo, encerrar
+	// (/api/sessions/{sid}/calls e abaixo). Não abre a gestão de sessões em si.
+	case strings.HasPrefix(p, "/api/sessions/") && strings.Contains(p, "/calls"):
+		return true
+	}
+	return false
+}
+
+// staticFileHandler serve o painel estático.
+//
+//   - index.html e widget.js revalidam (Cache-Control: no-cache) para o agente
+//     sempre pegar a última versão — um index.html velho apontaria pra um bundle
+//     antigo (sem o fallback de transporte da chamada), causando "chamada muda"
+//     após deploy. Os bundles com hash (/assets/index-<hash>.js) são imutáveis e
+//     seguem em cache normal.
+//   - Se WACALLS_DEFAULT_TRANSPORT estiver setado (ex.: "websocket"), injeta o
+//     valor no index.html (window.__WACALLS_DEFAULT_TRANSPORT). O painel então usa
+//     esse transporte por padrão, sem o agente precisar de ?transport=ws — útil
+//     em redes/servidores onde o WebRTC (UDP) não fecha e o WS é o caminho
+//     confiável. ?transport= e localStorage continuam tendo prioridade.
+func (s *server) staticFileHandler() http.Handler {
+	fs := http.FileServer(http.Dir(s.staticDir))
+	defaultTransport := strings.TrimSpace(os.Getenv("WACALLS_DEFAULT_TRANSPORT"))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/", "/index.html":
+			w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+			if defaultTransport != "" {
+				if b, err := os.ReadFile(filepath.Join(s.staticDir, "index.html")); err == nil {
+					inject := "<script>window.__WACALLS_DEFAULT_TRANSPORT=" + strconv.Quote(defaultTransport) + ";</script>"
+					html := strings.Replace(string(b), "</head>", inject+"</head>", 1)
+					w.Header().Set("Content-Type", "text/html; charset=utf-8")
+					_, _ = w.Write([]byte(html))
+					return
+				}
+			}
+		case "/widget.js":
+			w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+		}
+		fs.ServeHTTP(w, r)
 	})
 }
 
@@ -101,6 +469,17 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// accountFromClientID extrai o número da conta do padrão "astrachat_accN" usado pela
+// integração do Chatwoot (ex.: "astrachat_acc4" -> 4). Devolve 0 se não casar, para
+// o chamador manter o comportamento de escopo admin.
+func accountFromClientID(cid string) int {
+	const prefix = "astrachat_acc"
+	if !strings.HasPrefix(cid, prefix) {
+		return 0
+	}
+	return asInt(strings.TrimPrefix(cid, prefix))
 }
 
 func clientID(r *http.Request) string {
@@ -120,13 +499,55 @@ func (s *server) sessionByID(w http.ResponseWriter, sid string) *Session {
 }
 
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	s.broker.serveSSE(w, r, clientID(r))
+	// accountId (opcional) escopa os eventos de chamada por conta do Chatwoot: o
+	// widget do Chatwoot passa a conta dele; o painel admin não passa e recebe tudo.
+	acc := asInt(r.URL.Query().Get("accountId"))
+	cid := clientID(r)
+	// Rede de segurança: se a integração conectar SEM accountId, o escopo cairia em
+	// 0 (=painel admin) e essa conexão passaria a receber chamadas de TODAS as contas
+	// — misturando empresas (chamada tocando/contato criado na conta errada). Quando o
+	// clientId vem no padrão "astrachat_accN", derivamos a conta do próprio N para não
+	// depender da integração lembrar de mandar o parâmetro.
+	if acc == 0 {
+		if derived := accountFromClientID(cid); derived != 0 {
+			acc = derived
+		}
+	}
+	// diagnóstico: quem conectou no SSE e com qual conta (o widget deve passar a
+	// conta do Chatwoot; o painel, nenhuma). Ajuda a ver se a chamada não "entra"
+	// no Chatwoot por o widget não estar conectado ou estar em outra conta.
+	host := ""
+	if acc != 0 {
+		host = s.sessions.chatwootScopeHost(r.Header.Get("Origin"))
+	}
+	var inboxes map[int]bool
+	if acc != 0 {
+		inboxes = eventInboxes(r) // filtro por caixa só vale para widget de conta
+	}
+	s.log.Info("sse connect", "clientId", cid, "accountId", acc, "origin", r.Header.Get("Origin"), "cwHost", host, "inboxes", len(inboxes))
+	s.broker.serveSSE(w, r, cid, acc, host, inboxes)
+	s.log.Info("sse disconnect", "clientId", cid, "accountId", acc)
 }
 
 func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+	cfg := map[string]any{
 		"maxCallsPerSession": s.sessions.maxCalls,
-	})
+		// Transporte de mídia padrão da chamada (ex.: "websocket") — o widget do
+		// Chatwoot lê isso p/ usar WS por padrão onde o WebRTC (UDP) não fecha.
+		"defaultTransport": strings.TrimSpace(os.Getenv("WACALLS_DEFAULT_TRANSPORT")),
+		// Build rodando — o painel mostra `version` (canal: develop/vX.Y.Z) ao lado da
+		// logo e `commit` (SHA) no tooltip.
+		"version": version,
+		"commit":  commit,
+		// Chamada em grupo (experimental) habilitada nesta instância.
+		"groupCalls": groupCallsEnabled(),
+	}
+	// IP público anunciado no WebRTC/SIP e de onde veio (env, interface, stun:…,
+	// http:…) — diagnóstico do WACALLS_PUBLIC_IP=auto.
+	if ip, src := publicIPInfo(); ip != "" {
+		cfg["publicIp"], cfg["publicIpSource"] = ip, src
+	}
+	writeJSON(w, http.StatusOK, cfg)
 }
 
 func (s *server) handleSessionList(w http.ResponseWriter, r *http.Request) {
@@ -185,9 +606,32 @@ func (s *server) handleSessionPair(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// POST /api/sessions/{sid}/pair-code {phone}  → pareamento por código (sem QR)
+func (s *server) handleSessionPairCode(w http.ResponseWriter, r *http.Request) {
+	var b struct {
+		Phone string `json:"phone"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&b); err != nil || strings.TrimSpace(b.Phone) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "phone required"})
+		return
+	}
+	code, err := s.sessions.PairPhone(r.PathValue("sid"), normalizePhone(b.Phone))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"code": code})
+}
+
 func (s *server) handleStartCall(w http.ResponseWriter, r *http.Request) {
 	if sess := s.sessionByID(w, r.PathValue("sid")); sess != nil {
 		s.doStartCall(sess, w, r)
+	}
+}
+
+func (s *server) handleFakeCall(w http.ResponseWriter, r *http.Request) {
+	if sess := s.sessionByID(w, r.PathValue("sid")); sess != nil {
+		s.doFakeCall(sess, w, r)
 	}
 }
 
@@ -215,6 +659,205 @@ func (s *server) handleEndCall(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleCallVideo controla a negociação de vídeo mid-call numa chamada ativa.
+// action ∈ {request, accept, reject, stop}: pedir upgrade p/ vídeo, aceitar/recusar
+// um pedido recebido, ou desligar o vídeo (downgrade p/ áudio).
+// handleCallMute anuncia ao peer o estado do nosso microfone (<mute_v2>). Body:
+// {"muted": true|false}. Portado do zapo (indicador de mic-off no outro lado).
+func (s *server) handleCallMute(w http.ResponseWriter, r *http.Request) {
+	sess := s.sessionByID(w, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	ac, ok := sess.reg.get(r.PathValue("id"))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
+	var b struct {
+		Muted bool `json:"muted"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&b)
+	if err := ac.cm.AnnounceMute(r.Context(), b.Muted); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "muted": b.Muted})
+}
+
+// handleCallHand anuncia ao peer a nossa mão levantada/baixada. Body: {"raised": bool}.
+func (s *server) handleCallHand(w http.ResponseWriter, r *http.Request) {
+	sess := s.sessionByID(w, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	ac, ok := sess.reg.get(r.PathValue("id"))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
+	var b struct {
+		Raised bool `json:"raised"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&b)
+	if err := ac.cm.SetHandRaised(r.Context(), b.Raised); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "raised": b.Raised})
+}
+
+func (s *server) handleCallVideo(w http.ResponseWriter, r *http.Request) {
+	sess := s.sessionByID(w, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	id := r.PathValue("id")
+	ac, ok := sess.reg.get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
+	var err error
+	switch action := r.PathValue("action"); action {
+	case "request":
+		err = ac.cm.RequestVideoUpgrade(r.Context())
+	case "accept":
+		err = ac.cm.AcceptVideoUpgrade(r.Context())
+	case "reject":
+		err = ac.cm.RejectVideoUpgrade(r.Context())
+	case "stop":
+		err = ac.cm.StopVideo(r.Context())
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown video action"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleHold coloca uma chamada ativa em espera. Body opcional {"moh": true} liga a
+// música de espera para o interlocutor (padrão: true). O leg segue vivo.
+func (s *server) handleHold(w http.ResponseWriter, r *http.Request) {
+	sess := s.sessionByID(w, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	if c := s.sipAgentByID(sess, r.PathValue("id")); c != nil {
+		s.sipAgentHold(c, w, r)
+		return
+	}
+	id := r.PathValue("id")
+	ac, ok := sess.reg.get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
+	moh := true // por padrão toca música de espera
+	var body struct {
+		MOH *bool `json:"moh"`
+	}
+	if json.NewDecoder(r.Body).Decode(&body) == nil && body.MOH != nil {
+		moh = *body.MOH
+	}
+	if err := ac.cm.Hold(moh); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "held": true, "moh": moh})
+}
+
+// handleResume tira uma chamada da espera e volta a enviar/receber o áudio.
+func (s *server) handleResume(w http.ResponseWriter, r *http.Request) {
+	sess := s.sessionByID(w, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	if c := s.sipAgentByID(sess, r.PathValue("id")); c != nil {
+		s.sipAgentResume(c, w, r)
+		return
+	}
+	id := r.PathValue("id")
+	ac, ok := sess.reg.get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
+	if err := ac.cm.Resume(); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "held": false})
+}
+
+// handleTransfer faz uma transferência CEGA de uma chamada ativa para outro atendente:
+// põe a chamada em espera com música (o interlocutor não fica no silêncio), libera o
+// dono e re-oferece a chamada. Body opcional {"to":"<clientId>"} mira um atendente
+// específico; sem ele, a oferta vai a todos os atendentes da conta (fila).
+// O leg do WhatsApp NÃO é tocado — só muda quem tem a ponte de áudio.
+func (s *server) handleTransfer(w http.ResponseWriter, r *http.Request) {
+	sess := s.sessionByID(w, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	if c := s.sipAgentByID(sess, r.PathValue("id")); c != nil {
+		s.sipAgentTransfer(c, w, r)
+		return
+	}
+	id := r.PathValue("id")
+	ac, ok := sess.reg.get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
+	var body struct {
+		To string `json:"to"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	// Melhor esforço: coloca em espera com música. Se já estiver em espera, tudo bem.
+	_ = ac.cm.Hold(true)
+
+	from := clientID(r)
+	s.broker.reassignOwner(id, nil) // libera o dono para o alvo poder assumir
+	peer := ""
+	if cr, ok := s.broker.getCall(id); ok && cr != nil {
+		peer = cr.Peer
+	}
+	s.broker.emitTransferOffer(sess.id, id, peer, from, strings.TrimSpace(body.To))
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "transferred": true, "to": strings.TrimSpace(body.To)})
+}
+
+// handlePickup assume uma chamada transferida: fixa o novo dono SEM re-aceitar no
+// WhatsApp (a chamada já está ativa). Em seguida o navegador do atendente chama
+// .../webrtc (abre a ponte, que troca automaticamente) e depois .../resume para tirar
+// da espera.
+func (s *server) handlePickup(w http.ResponseWriter, r *http.Request) {
+	sess := s.sessionByID(w, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	if c := s.sipAgentByID(sess, r.PathValue("id")); c != nil {
+		s.sipAgentPickup(c, w, r)
+		return
+	}
+	id := r.PathValue("id")
+	if _, ok := sess.reg.get(id); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
+	owner := clientID(r)
+	if !s.broker.reassignOwner(id, &owner) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
+	s.broker.emitTransferClaimed(sess.id, id, owner)
+	writeJSON(w, http.StatusOK, map[string]any{"call": map[string]string{"callId": id}})
+}
+
 func (s *server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	if sess := s.sessionByID(w, r.PathValue("sid")); sess != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"rows": s.broker.historyRows(sess.id, 50)})
@@ -227,9 +870,10 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var body struct {
-		Phone      string `json:"phone"`
-		DurationMs int    `json:"duration_ms"`
-		Record     bool   `json:"record"`
+		Phone      string  `json:"phone"`
+		DurationMs flexInt `json:"duration_ms"` // reservado (ignorado); aceita número ou string
+		Record     bool    `json:"record"`
+		Video      bool    `json:"video"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Phone) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "phone required"})
@@ -238,13 +882,13 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 	owner := clientID(r)
 	// (removido) regra "1 chamada por operador" — agora o mesmo navegador/aba
 	// pode disparar várias ligações na mesma sessão (até -max-calls-per-session).
-	if max := s.sessions.maxCalls; max > 0 && sess.reg.count() >= max {
+	if max := s.sessions.maxCalls; max > 0 && sess.activeCallCount() >= max {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "max concurrent calls"})
 		return
 	}
 	peer := types.NewJID(normalizePhone(body.Phone), types.DefaultUserServer)
 
-	callID, err := sess.startOutgoing(r.Context(), peer, false)
+	callID, err := sess.startOutgoing(r.Context(), peer, body.Video, body.Record)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -256,8 +900,49 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, map[string]any{"call": map[string]string{"callId": callID}})
 }
 
+// doFakeCall dispara um "toque fantasma": faz o aparelho do destinatário tocar por
+// alguns segundos (offer) e encerra (terminate), sem estabelecer áudio/vídeo. Serve
+// só para chamar atenção. Corpo: {phone, video?, duration_ms?}. duration_ms default
+// 3000, teto 30000 (evita virar chamada real longa).
+func (s *server) doFakeCall(sess *Session, w http.ResponseWriter, r *http.Request) {
+	if sess.client.Store.ID == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "not paired"})
+		return
+	}
+	var body struct {
+		Phone      string  `json:"phone"`
+		Video      bool    `json:"video"`
+		DurationMs flexInt `json:"duration_ms"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Phone) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "phone required"})
+		return
+	}
+	dur := 3 * time.Second
+	if body.DurationMs.Int() > 0 {
+		dur = time.Duration(body.DurationMs.Int()) * time.Millisecond
+	}
+	if dur > 30*time.Second {
+		dur = 30 * time.Second
+	}
+	peer := types.NewJID(normalizePhone(body.Phone), types.DefaultUserServer)
+	callID, err := sess.fakeCall(r.Context(), peer, body.Video, dur)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"call":       map[string]string{"callId": callID},
+		"durationMs": dur.Milliseconds(),
+	})
+}
+
 func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request) {
 	callID := r.PathValue("id")
+	if c := s.sipAgentByID(sess, callID); c != nil {
+		s.sipAgentWebRTC(c, w, r)
+		return
+	}
 	ac, ok := sess.reg.get(callID)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
@@ -289,7 +974,13 @@ func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request)
 		if err != nil {
 			return
 		}
-		ac.cm.FeedCapturedPCM(media.Downsample48to16(pcm48))
+		down := media.Downsample48to16(pcm48)
+		ac.recorder.writeBrowser(down)
+		ac.spies.feed(spySideAgent, down)
+		ac.cm.FeedCapturedPCM(down)
+	}
+	bridge.OnBrowserVideo = func(au []byte) {
+		ac.cm.FeedCapturedVideo(au)
 	}
 	bridge.OnTerminalICE = func() {
 		go sess.terminateCall(callID, core.EndCallReasonUserEnded)
@@ -298,23 +989,39 @@ func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]string{"sdp_answer": answer})
 }
 
+// sipAgentByID devolve a chamada do modo agente SIP com esse id na sessão (ou nil).
+func (s *server) sipAgentByID(sess *Session, id string) *sipAgentCall {
+	if s.sipGW == nil || !strings.HasPrefix(id, "sip-") {
+		return nil
+	}
+	return s.sipGW.agentCall(sess.id, id)
+}
+
 func (s *server) doAccept(sess *Session, w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if c := s.sipAgentByID(sess, id); c != nil {
+		s.sipAgentAccept(c, w, r)
+		return
+	}
 	ac, ok := sess.reg.get(id)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
 		return
 	}
 	owner := clientID(r)
-	if other := s.broker.ownerActiveCall(owner); other != "" && other != id {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "operator already on a call"})
-		return
-	}
+	// Antes bloqueávamos o operador de aceitar uma 2ª chamada com uma já ativa. Agora
+	// permitimos "atender em espera": o painel coloca a atual em hold e aceita a nova.
+	// Mantemos só a reivindicação de dono (evita dois clientes pegarem a mesma chamada).
 	if !s.broker.setOwner(id, owner) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "claimed by another client"})
 		return
 	}
 	s.broker.emitIncomingClaimed(sess.id, id, owner)
+	// atendida aqui (painel, ponte de voz): para de tocar no PBX pelo tronco SIP —
+	// senão o ramal seguia chamando enquanto outro já estava na ligação.
+	if s.sipGW != nil {
+		s.sipGW.cancelInboundRing(id)
+	}
 	if err := ac.cm.AcceptCall(r.Context(), id); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -324,16 +1031,37 @@ func (s *server) doAccept(sess *Session, w http.ResponseWriter, r *http.Request)
 
 func (s *server) doReject(sess *Session, w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if ac, ok := sess.reg.get(id); ok {
-		_ = ac.cm.RejectCall(r.Context(), id, core.EndCallReasonDeclined)
+	if c := s.sipAgentByID(sess, id); c != nil {
+		s.sipAgentReject(c, w, r)
+		return
 	}
+	ac, ok := sess.reg.get(id)
+	if !ok {
+		// callId desconhecido: NÃO responde 200 (antes respondia, então o cliente
+		// não distinguia "recusou" de "id errado/chamada já encerrada"). 404 deixa
+		// claro que a recusa não foi aplicada — o id certo é o mesmo do evento
+		// `incoming`/`call-list` (a chave da chamada).
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call", "status": "not_applied"})
+		return
+	}
+	// RejectCall envia o <reject> ao WhatsApp (encerra de fato a chamada de entrada).
+	err := ac.cm.RejectCall(r.Context(), id, core.EndCallReasonDeclined)
 	sess.removeCall(id)
 	s.broker.endCall(id, string(core.EndCallReasonDeclined))
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "status": "not_applied"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *server) doEndCall(sess *Session, w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if c := s.sipAgentByID(sess, id); c != nil {
+		c.end("agent_hangup", 486)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if ac, ok := sess.reg.get(id); ok {
 		_ = ac.cm.EndCall(r.Context(), core.EndCallReasonUserEnded)
 	}
